@@ -6,7 +6,7 @@ class MT5_connection:
         self.connected = False
     def connect(self):
         if not mt5.initialize():
-            raise ConnectionError("MT 5 initialization failed")
+            raise ConnectionError(f"MT 5 initialization failed: {mt5.last_error()}")
         self.connected=True
         print("MT 5 connected successfully")
     def disconnect(self):
