@@ -17,6 +17,12 @@ class BacktestHours:
         if 7<=hour<11: return True # london
         if 12<= hour<16: return True # NY
         return False
+def get_htf_index(m15_time,times_h1):
+    for i in range (len(times_h1)-1):
+        if times_h1[i] <= m15_time < times_h1[i+1]:
+            return i
+    return None
+
 def run_backtest():
     conn=MT5_connection()
     try:
@@ -26,27 +32,31 @@ def run_backtest():
         return []
     print("fetching 99,999 bars....")
     # mt 5 return numpy structured array but we treat as list of tupple
-    rates = mt5.copy_rates_from_pos("EURUSD",mt5.TIMEFRAME_M15,0,99999)
+    rates_m15 = mt5.copy_rates_from_pos("EURUSD",mt5.TIMEFRAME_M15,0,99999)
+    rates_h1 = mt5.copy_rates_from_pos("EURUSD",mt5.TIMEFRAME_H1,0,99999)
     conn.disconnect()
-    if rates is None:
+    if rates_m15 is None:
         print("Error: No data received from MT5.")
         return []
     # extract closes into full list
     # Bar structure: (time, open, high, low, close, tick_volume, spread, real_volume)
-    closes = [bar[4] for bar in rates]
-    highs= [bar[2] for bar in rates]
-    lows = [bar[3] for bar in rates]
-    times = [bar[0] for bar in rates]
-    atr_full = indicators.indicator.ATR(14).calculate(closes,highs,lows)
+    closes_m15 = [bar[4] for bar in rates_m15]
+    highs_m15= [bar[2] for bar in rates_m15]
+    lows_m15 = [bar[3] for bar in rates_m15]
+    times_m15 = [bar[0] for bar in rates_m15]
+    closes_h1 = [bar[4] for bar in rates_h1]
+    times_h1 = [bar[0] for bar in rates_h1]
+    atr_full = indicators.indicator.ATR(14).calculate(closes_m15,highs_m15,lows_m15)
+    tema_60_h1 = indicators.indicator.TEMA(60).calculate(closes_h1)
 
     print("calculating indicators")
     # using existing classes
-    tema9_full = indicators.indicator.TEMA(9).calculate(closes)
-    tema20_full = indicators.indicator.TEMA(20).calculate(closes)
-    rsi_full = indicators.indicator.RSI(7).calculate(closes)
-    tema60_full = indicators.indicator.TEMA(60).calculate(closes)
+    tema9_full = indicators.indicator.TEMA(9).calculate(closes_m15)
+    tema20_full = indicators.indicator.TEMA(20).calculate(closes_m15)
+    rsi_full = indicators.indicator.RSI(14).calculate(closes_m15)
+    tema60_full = indicators.indicator.TEMA(60).calculate(closes_m15)
     # --- DEBUG PRINTS ---
-    print(f"Closes           :  {len(closes)}")
+    print(f"Closes           :  {len(closes_m15)}")
     print(f"Length of TEMA 9 :  {len(tema9_full)}")
     print(f"Length of TEMA 20:  {len(tema20_full)}")
     print(f"Length of RSI    :  {len(rsi_full)}")
@@ -60,14 +70,15 @@ def run_backtest():
     diff = len(tema9_full) - len(tema60_full)
     tema9_aligned = tema9_full[diff:]
     # align closes and times to tema60
-    offset = len(closes) - len(tema60_full)
+    offset = len(closes_m15) - len(tema60_full)
+    h1_offset = len(closes_h1) - len(tema_60_h1)
     # align rsi to tema60
     rsi_diff = len(rsi_full) - len(tema60_full)
     # atr diff
     atr_diff = len(atr_full) - len(tema60_full)
-
     hours =BacktestHours()
     trade_returns =[]
+    
 
     print("Scanning for crossovers...")
     
@@ -75,75 +86,104 @@ def run_backtest():
     session_skipped = 0
     crosses_found = 0
     time_stop_hitted = 0
+    htf_none = 0
+    trend_up_count = 0
+    trend_down_count = 0
+    rsi_fail = 0 
     print("simulating trade...")
     for i in range(1,len(tema60_full)-1):
         # index in closes list
         idx= i + offset
 
         #check session
-        if not hours.is_active(times[idx]):
+        if not hours.is_active(times_m15[idx]):
             session_skipped+=1
             continue
+        # Get HTF index for M15 time frame
+        htf_idx = get_htf_index(times_m15[idx],times_h1)
+        if htf_idx is None:
+            htf_none+=1
+            continue
+        tema_idx = htf_idx-h1_offset
+        if tema_idx < 0 or tema_idx >= len(tema_60_h1):
+            continue
+        trend_up = closes_h1[htf_idx] > tema_60_h1[tema_idx]
+        trend_down = closes_h1[htf_idx] < tema_60_h1[tema_idx]
         # crossover logic
         # golden cross
-        
-        if tema9_aligned[i-1] <= tema20_aligned[i-1] and tema9_aligned[i] > tema20_aligned[i]:
-            if tema60_full[i] < closes[idx]: # mean
-                crosses_found+=1
-                rsi_idx = i+rsi_diff
-                if 0 <= rsi_idx < len(rsi_full) and rsi_full[rsi_idx] > 50:
-                    entry = closes[idx]
-                    atr_idx = i +atr_diff
-                    atr = atr_full[atr_idx]
-                    sl = atr*1.5 #stoploss 1.5x ATR
-                    tp = sl *2 # TP at 2 times SL
-                    result = None 
-                    for j in range (idx+1, min(idx+48, len(closes)-1)): # max 48 bars = 12 hour
-                        high_j = highs[j]
-                        low_j = lows[j]
-                        if high_j >= entry + tp:
-                            result = tp / entry    # TP hit 
-                            break
-                        if low_j <= entry - sl:
-                            result = -(sl / entry) # SL hit 
-                            break
-                    if result is None:
-                        exit_idx = min(idx+48, len(closes)-1)
-                        result = (closes[exit_idx]-entry)/entry # time stop
-                        time_stop_hitted+=1
-                    trade_returns.append(result-0.0001) # spread
+        #if tema9_aligned[i-1] <= tema20_aligned[i-1] and tema9_aligned[i] > tema20_aligned[i]:
+        if trend_up:
+            trend_up_count+=1
+            if tema60_full[i] < closes_m15[idx]: 
+                if closes_m15[idx] < closes_m15[idx-1]: #pullback
+                    crosses_found+=1
+                    #rsi_idx = i+rsi_diff
+                    #if 0 <= rsi_idx < len(rsi_full) and rsi_full[rsi_idx] < 45:
+                    if True:
+                        entry = closes_m15[idx]
+                        atr_idx = i +atr_diff
+                        atr = atr_full[atr_idx]
+                        sl = atr*1.5 #stoploss 1.5x ATR
+                        tp = sl *2 # TP at 2 times SL
+                        result = None 
+                        for j in range (idx+1, min(idx+48, len(closes_m15)-1)): # max 48 bars = 12 hour
+                            high_j = highs_m15[j]
+                            low_j = lows_m15[j]
+                            if high_j >= entry + tp:
+                                result = tp / entry    # TP hit 
+                                break
+                            if low_j <= entry - sl:
+                                result = -(sl / entry) # SL hit 
+                                break
+                        if result is None:
+                            exit_idx = min(idx+48, len(closes_m15)-1)
+                            result = (closes_m15[exit_idx]-entry)/entry # time stop
+                            time_stop_hitted+=1
+                        trade_returns.append(result-0.0001) # spread
+                    #else:
+                        #rsi_fail+=1
         # dead cross
-        elif tema9_aligned[i-1] >= tema20_aligned[i-1] and tema9_aligned[i] < tema20_aligned[i]:
-            if tema60_full[i] > closes[idx]: # mean reversion
-                crosses_found += 1
-                rsi_idx = i + rsi_diff
-                if 0 <= rsi_idx < len(rsi_full) and rsi_full[rsi_idx] < 50: 
-                # Short: Entry - Exit
-                    entry = closes[idx]
-                    atr_idx = i +atr_diff
-                    atr = atr_full[atr_idx]
-                    sl = atr*1.5 #stoploss 1.5x ATR
-                    tp = sl *2 # TP at 2 times SL
-                    result = None 
-                    for j in range (idx+1, min(idx+48, len(closes)-1)): # max 48 bars = 12 hour
-                        high_j = highs[j]
-                        low_j = lows[j]
-                        if low_j <= entry - tp:
-                            result = tp / entry    # TP hit 
-                            break
-                        if high_j >= entry + sl:
-                            result = -(sl / entry) # SL hit 
-                            break
-                    if result is None:
-                        exit_idx = min(idx+48, len(closes)-1)
-                        result = (entry-closes[exit_idx])/entry # time stop
-                        time_stop_hitted+=1
-                    trade_returns.append(result-0.0001) # spread
+        #elif tema9_aligned[i-1] >= tema20_aligned[i-1] and tema9_aligned[i] < tema20_aligned[i]:
+        elif trend_down:
+            trend_down_count+=1
+            if tema60_full[i] > closes_m15[idx]: # 
+                if closes_m15[idx] > closes_m15 [idx-1]: #pullback
+                    crosses_found += 1
+                    rsi_idx = i + rsi_diff
+                    #if 0 <= rsi_idx < len(rsi_full) and rsi_full[rsi_idx] > 55: 
+                    if True:
+                    # Short: Entry - Exit
+                        entry = closes_m15[idx]
+                        atr_idx = i +atr_diff
+                        atr = atr_full[atr_idx]
+                        sl = atr*1.5 #stoploss 1.5x ATR
+                        tp = sl *2 # TP at 2 times SL
+                        result = None 
+                        for j in range (idx+1, min(idx+48, len(closes_m15)-1)): # max 48 bars = 12 hour
+                            high_j = highs_m15[j]
+                            low_j = lows_m15[j]
+                            if low_j <= entry - tp:
+                                result = tp / entry    # TP hit 
+                                break
+                            if high_j >= entry + sl:
+                                result = -(sl / entry) # SL hit 
+                                break
+                        if result is None:
+                            exit_idx = min(idx+48, len(closes_m15)-1)
+                            result = (entry-closes_m15[exit_idx])/entry # time stop
+                            time_stop_hitted+=1
+                        trade_returns.append(result-0.0001) # spread
+                    #else:
+                        #rsi_fail+=1
     print(f"Debug: Total crosses found           : {crosses_found}")
     print(f"Debug: Bars skipped by session filter: {session_skipped}")
     print(f"Debug: Trades that passed RSI filter : {len(trade_returns)}")
     print(f"time stop hitted                     : {time_stop_hitted}")
     print(f"trade after RSI filter               : {len(trade_returns)}")
+    print(f"HTF None                             : {htf_none}")
+    print(f"trend up                             : {trend_up_count}")
+    print(f"trend down count                     : {trend_down_count}")
+    print(f"RSI fail                             :  {rsi_fail}")
     if trade_returns:
         winning_trades = len([r for r in trade_returns if r > 0])
         losing_trades = len([r for r in trade_returns if r <= 0])
